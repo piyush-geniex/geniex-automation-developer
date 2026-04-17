@@ -2,8 +2,8 @@
 Agent session state management for the price intelligence platform.
 
 Maintains the complete identity context for each scraping job:
-cookies (including Cloudflare clearance), user-agent, and account
-assignment. Provides session persistence and restoration across retries.
+cookies (including Cloudflare clearance) and user-agent.
+Provides session persistence and restoration across retries.
 """
 
 from __future__ import annotations
@@ -11,9 +11,9 @@ from __future__ import annotations
 import logging
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict
 
-from .models import Account, AccountStatus, Job, Session
+from .models import Job
 
 logger = logging.getLogger(__name__)
 
@@ -22,41 +22,15 @@ class SessionManager:
     """
     Single source of truth for all agent session state.
 
-    Callers should use get_session_cookies() for initial requests and
-    restore_session() for retries. Direct manipulation of cookies or
-    account state outside this class violates its coherence guarantees.
+    Callers should use restore_session() to obtain cookies for a job.
+    Direct manipulation of cookies outside this class violates its
+    coherence guarantees.
     """
 
-    def __init__(self, accounts: List[Account]) -> None:
-        self._accounts: Dict[str, Account] = {a.id: a for a in accounts}
-        # job_id → Session snapshot (persisted after each successful request)
-        self._sessions: Dict[str, Session] = {}
-        # account_id → campaign_id (tracks which campaign has which account)
-        self._account_assignments: Dict[str, str] = {}
-
-    def get_available_account(self, campaign_id: str) -> Optional[Account]:
-        """Return an available active account and assign it to this campaign."""
-        for account in self._accounts.values():
-            if account.status != AccountStatus.ACTIVE:
-                continue
-            if account.campaign_id and account.campaign_id != campaign_id:
-                continue
-            account.campaign_id = campaign_id
-            return account
-        return None
-
-    def get_session_cookies(self, job: Job) -> dict:
-        """
-        Return the current cookie jar for the account assigned to this job.
-
-        Used for the first attempt on a fresh or previously-completed job.
-        Returns a copy of the account's stored cookies, which may include
-        a cf_clearance token from a prior session.
-        """
-        account = self._accounts.get(job.assigned_account_id or "")
-        if not account:
-            return {}
-        return deepcopy(account.cookies)
+    def __init__(self) -> None:
+        # job_id → cookie dict (persisted after each successful request)
+        self._sessions: Dict[str, dict] = {}
+        self._user_agents: Dict[str, str] = {}
 
     def restore_session(self, job: Job) -> dict:
         """
@@ -68,20 +42,15 @@ class SessionManager:
         This makes them safely portable across proxy rotations within
         the same session window as long as the user-agent is preserved.
 
-        If no persisted session exists, falls back to get_session_cookies().
+        If no persisted session exists, returns an empty cookie jar.
         """
-        session = self._sessions.get(job.id)
-        if session:
-            logger.debug(
-                "restoring session for job %s (account=%s proxy=%s)",
-                job.id, session.account_id, session.proxy_id,
-            )
-            return deepcopy(session.cookies)
+        cookies = self._sessions.get(job.id)
+        if cookies:
+            logger.debug("restoring session for job %s", job.id)
+            return deepcopy(cookies)
 
-        logger.debug(
-            "no persisted session for job %s — using account cookies", job.id
-        )
-        return self.get_session_cookies(job)
+        logger.debug("no persisted session for job %s — empty cookie jar", job.id)
+        return {}
 
     def store_session(
         self,
@@ -94,21 +63,12 @@ class SessionManager:
         Persist the session state after a successful request.
         Called by the worker after each successful response for future restore_session calls.
         """
-        now = datetime.now(timezone.utc).isoformat()
-        self._sessions[job.id] = Session(
-            id=job.id,
-            account_id=job.assigned_account_id or "",
-            proxy_id=proxy_id,
-            campaign_id=job.campaign_id,
-            cookies=deepcopy(cookies),
-            user_agent=user_agent,
-            created_at=now,
-            last_active_at=now,
+        self._sessions[job.id] = deepcopy(cookies)
+        self._user_agents[job.id] = user_agent
+        logger.debug(
+            "session stored for job %s (proxy=%s) at %s",
+            job.id, proxy_id, datetime.now(timezone.utc).isoformat(),
         )
-        # Also update the account's cookie jar for future get_session_cookies calls
-        account = self._accounts.get(job.assigned_account_id or "")
-        if account:
-            account.cookies.update(cookies)
 
     def invalidate_session(self, job_id: str) -> None:
         """Remove the persisted session snapshot for a job."""
@@ -116,19 +76,10 @@ class SessionManager:
         if removed:
             logger.debug("session invalidated for job %s", job_id)
 
-    def lock_account(self, account_id: str, reason: str = "") -> None:
-        """Mark an account as suspended."""
-        account = self._accounts.get(account_id)
-        if account:
-            account.status = AccountStatus.SUSPENDED
-            logger.warning("account %s suspended: %s", account_id, reason)
-
     def get_user_agent(self, job: Job) -> str:
-        session = self._sessions.get(job.id)
-        if session:
-            return session.user_agent
-        return (
+        return self._user_agents.get(
+            job.id,
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/120.0.0.0 Safari/537.36",
         )

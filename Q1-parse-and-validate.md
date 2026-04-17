@@ -8,6 +8,8 @@ HTTP fetch → error classification → HTML parse → mark job complete
 
 Each layer is designed to have a single responsibility. Read `worker.py`, `http_client.py`, and `scraper.py` carefully before answering.
 
+> *Hint: the docstring on `PriceParser.parse()` is load-bearing — read it twice.*
+
 ---
 
 **(a)**
@@ -39,3 +41,9 @@ Now read the docstring on `PriceParser.parse()`. It contains a statement about w
 Given your analysis above: where in the pipeline would correct detection of a non-product page (challenge page, access-denied page) need to occur?
 
 Why can't the fix be placed inside `PriceParser` without modifying `worker.py` as well?
+
+---
+
+**(d)**
+
+In one paragraph (3-5 sentences), describe what a correct fix would look like. Where would the validation live, and **what specific signals in a Cloudflare challenge response would you inspect** to distinguish it from a real product page?
