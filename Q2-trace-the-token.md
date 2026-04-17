@@ -1,8 +1,10 @@
-# Q4 — Trace the Token
+# Q2 — Trace the Token
 
 This question traces a specific execution path through four files. Use `seed_jobs.py` as ground truth for the starting state.
 
-**Starting state**: A worker is retrying job **J-015** from Campaign C-002. The proxy pool's `acquire()` method returns **P-003** — which shows `status = HEALTHY` in the seed data.
+> *Suggested reading order: `http_client.py` (ErrorClassifier) → `proxy_pool.py` (rotate) → `seed_jobs.py` proxy comments.*
+
+**Starting state**: A worker is retrying job **J-015** for a campaign that has been running through several proxies. The proxy pool's `acquire()` method returns **P-003** — which shows `status = HEALTHY` in the seed data.
 
 ---
 
@@ -69,3 +71,5 @@ What is J-015's final status? How many proxies are in `COOLING_DOWN` state?
 Of the proxies that entered `COOLING_DOWN` during this sequence, how many were actually IP-banned by the target site? How many were rotated for other reasons?
 
 What is the root cause of the proxy pool exhaustion? What single conceptual change to `ErrorClassifier` would prevent this cascade?
+
+**Bonus:** Read `captcha_solver.py`. If your fix triggers a fresh CAPTCHA solve after a proxy rotation, what specifically would you change about the call to the CAPTCHA provider to ensure the new token will pass Cloudflare's IP check?

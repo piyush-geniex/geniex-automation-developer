@@ -1,9 +1,8 @@
 """
 CAPTCHA provider integration for the price intelligence platform.
 
-Wraps the CapSolver API for Cloudflare Turnstile challenges.
-All solve attempts — successful or not — are tracked externally by
-the worker via job.captcha_solves_used.
+Wraps the CapSolver Turnstile API. Worker code calls solve_turnstile()
+to obtain a fresh cf_clearance-bound token for a given target URL.
 """
 
 from __future__ import annotations
@@ -19,17 +18,16 @@ from .config import config
 
 logger = logging.getLogger(__name__)
 
-# CapSolver API endpoints
-_CAPSOLVER_CREATE_TASK = "https://api.capsolver.com/createTask"
-_CAPSOLVER_GET_RESULT = "https://api.capsolver.com/getTaskResult"
+
+# CapSolver task types
+# https://docs.capsolver.com/guide/captcha/Turnstile.html
+_TASK_TYPE = "AntiTurnstileTaskProxyLess"
+
+_API_BASE = "https://api.capsolver.com"
 
 
 class CaptchaProviderError(Exception):
-    """Raised when the CAPTCHA provider is unavailable or returns an error."""
-
-
-class CaptchaTimeoutError(CaptchaProviderError):
-    """Raised when a task exceeds the polling timeout."""
+    """Raised on provider-side failures (auth, 5xx, malformed responses)."""
 
 
 @dataclass
@@ -41,132 +39,68 @@ class SolveResult:
 
 class CaptchaSolver:
     """
-    Solves Cloudflare Turnstile challenges via the CapSolver API.
+    Minimal CapSolver client for Cloudflare Turnstile challenges.
 
-    Usage:
-        solver = CaptchaSolver()
-        result = solver.solve_turnstile(page_url, site_key, job_id=job.id)
-        # result.token is the cf-turnstile-response value
-
-    Raises CaptchaProviderError on provider failure (503, bad API key, etc.)
-    Raises CaptchaTimeoutError if the task takes too long.
+    Submits a Turnstile task to the provider and polls until the token is
+    ready. Returns a SolveResult containing the cf_clearance token to inject
+    into the request cookie jar.
     """
 
     def __init__(self, api_key: Optional[str] = None) -> None:
         self._api_key = api_key or config.captcha.api_key
+        self._poll_interval = config.captcha.poll_interval_seconds
+        self._timeout = config.captcha.task_timeout_seconds
 
     def solve_turnstile(
         self,
-        page_url: str,
-        site_key: str,
+        website_url: str,
+        website_key: str,
         job_id: str = "",
-        proxy_url: Optional[str] = None,
     ) -> SolveResult:
         """
-        Submit a Turnstile task and poll until resolved.
+        Solve a Cloudflare Turnstile challenge for the given URL.
 
-        Args:
-            page_url:  The URL of the page requiring the challenge
-            site_key:  The Turnstile site key from the page source
-            job_id:    For logging correlation only
-            proxy_url: Optional proxy for the solve request (provider-side)
-
-        Returns:
-            SolveResult with the token value
-
-        Raises:
-            CaptchaProviderError: provider API error (503, auth failure, etc.)
-            CaptchaTimeoutError:  task did not resolve within timeout window
+        Submits an AntiTurnstileTaskProxyLess task to CapSolver — the provider
+        executes the challenge from its own infrastructure and returns the
+        resulting token. Caller injects the token as `cf_clearance` in the
+        request cookie jar.
         """
-        t0 = time.monotonic()
-        task_id = self._create_task(page_url, site_key, proxy_url, job_id)
-        token = self._poll_result(task_id, job_id)
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "captcha solved: job=%s task=%s elapsed=%.2fs",
-            job_id, task_id, elapsed,
-        )
-        return SolveResult(token=token, elapsed_seconds=elapsed, task_id=task_id)
+        start = time.monotonic()
 
-    def _create_task(
-        self,
-        page_url: str,
-        site_key: str,
-        proxy_url: Optional[str],
-        job_id: str,
-    ) -> str:
-        payload: dict = {
+        create_payload = {
             "clientKey": self._api_key,
             "task": {
-                "type": "AntiTurnstileTaskProxyLess",
-                "websiteURL": page_url,
-                "websiteKey": site_key,
+                "type": _TASK_TYPE,
+                "websiteURL": website_url,
+                "websiteKey": website_key,
             },
         }
 
-        logger.debug("creating captcha task: job=%s url=%s", job_id, page_url)
-        try:
-            resp = requests.post(
-                _CAPSOLVER_CREATE_TASK,
-                json=payload,
-                timeout=10,
-            )
-        except requests.RequestException as exc:
-            raise CaptchaProviderError(f"network error creating task: {exc}") from exc
-
-        if resp.status_code != 200:
-            raise CaptchaProviderError(
-                f"provider returned {resp.status_code}: {resp.text[:200]}"
-            )
-
+        resp = requests.post(f"{_API_BASE}/createTask", json=create_payload, timeout=15)
+        if resp.status_code >= 500:
+            raise CaptchaProviderError(f"{resp.status_code} {resp.reason}")
         body = resp.json()
-        if body.get("errorId") != 0:
-            raise CaptchaProviderError(
-                f"provider error: {body.get('errorDescription', 'unknown')}"
-            )
+        if body.get("errorId"):
+            raise CaptchaProviderError(body.get("errorDescription", "createTask failed"))
 
-        task_id: str = body["taskId"]
-        logger.debug("captcha task created: job=%s task_id=%s", job_id, task_id)
-        return task_id
+        task_id = body["taskId"]
+        logger.info("captcha task %s submitted for job %s", task_id, job_id)
 
-    def _poll_result(self, task_id: str, job_id: str) -> str:
-        deadline = time.monotonic() + config.captcha.task_timeout_seconds
-        payload = {"clientKey": self._api_key, "taskId": task_id}
-
-        while time.monotonic() < deadline:
-            time.sleep(config.captcha.poll_interval_seconds)
-            try:
-                resp = requests.post(
-                    _CAPSOLVER_GET_RESULT,
-                    json=payload,
-                    timeout=10,
+        # Poll until ready or timeout
+        while time.monotonic() - start < self._timeout:
+            time.sleep(self._poll_interval)
+            poll = requests.post(
+                f"{_API_BASE}/getTaskResult",
+                json={"clientKey": self._api_key, "taskId": task_id},
+                timeout=15,
+            ).json()
+            if poll.get("status") == "ready":
+                return SolveResult(
+                    token=poll["solution"]["token"],
+                    elapsed_seconds=time.monotonic() - start,
+                    task_id=task_id,
                 )
-            except requests.RequestException as exc:
-                raise CaptchaProviderError(
-                    f"network error polling task {task_id}: {exc}"
-                ) from exc
+            if poll.get("errorId"):
+                raise CaptchaProviderError(poll.get("errorDescription", "poll failed"))
 
-            if resp.status_code != 200:
-                raise CaptchaProviderError(
-                    f"provider returned {resp.status_code} while polling"
-                )
-
-            body = resp.json()
-            if body.get("errorId") != 0:
-                raise CaptchaProviderError(
-                    f"provider error: {body.get('errorDescription', 'unknown')}"
-                )
-
-            status = body.get("status")
-            if status == "ready":
-                token: str = body["solution"]["token"]
-                return token
-            if status == "processing":
-                logger.debug("task %s still processing (job=%s)", task_id, job_id)
-                continue
-            raise CaptchaProviderError(f"unexpected task status: {status!r}")
-
-        raise CaptchaTimeoutError(
-            f"task {task_id} did not resolve within "
-            f"{config.captcha.task_timeout_seconds}s"
-        )
+        raise CaptchaProviderError(f"timeout after {self._timeout}s for task {task_id}")

@@ -32,12 +32,6 @@ class ProxyType(str, Enum):
     MOBILE = "mobile"
 
 
-class AccountStatus(str, Enum):
-    ACTIVE = "ACTIVE"
-    SUSPENDED = "SUSPENDED"
-    RATE_LIMITED = "RATE_LIMITED"
-
-
 class CampaignStatus(str, Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -147,6 +141,9 @@ class Proxy:
     last_used_at: Optional[str]
     ban_count: int = 0
     success_count: int = 0
+    # Tracks back-to-back failures within the active session window.
+    # Used by the pool to skip proxies that are repeatedly failing.
+    consecutive_failures: int = 0
 
     def is_sticky_active(self) -> bool:
         """Return True if this proxy is still within its stickiness window."""
@@ -154,29 +151,6 @@ class Proxy:
             return False
         expiry = datetime.fromisoformat(self.sticky_until.replace("Z", "+00:00"))
         return datetime.now(timezone.utc) < expiry
-
-
-@dataclass
-class Account:
-    id: str
-    username: str
-    password: str
-    status: AccountStatus
-    cookies: dict                          # name → cookie value
-    last_login_at: Optional[str]
-    campaign_id: Optional[str]
-
-
-@dataclass
-class Session:
-    id: str
-    account_id: str
-    proxy_id: str
-    campaign_id: str
-    cookies: dict
-    user_agent: str
-    created_at: str
-    last_active_at: str
 
 
 @dataclass
@@ -190,7 +164,6 @@ class Job:
     # invalid tokens, and successful solves all consume from this budget.
     captcha_solves_used: int
     assigned_proxy_id: Optional[str]
-    assigned_account_id: Optional[str]
     result: Optional[JobResult]
     created_at: str
     updated_at: str

@@ -62,6 +62,15 @@ class ProxyPool:
         for proxy in self._proxies.values():
             if proxy.status != ProxyStatus.HEALTHY:
                 continue
+            # Skip proxies that have crossed the consecutive-failure threshold
+            # to prevent assigning a repeatedly-failing proxy to a fresh campaign.
+            if proxy.consecutive_failures >= config.proxy.max_consecutive_failures:
+                logger.debug(
+                    "skipping proxy %s — consecutive_failures=%d >= threshold=%d",
+                    proxy.id, proxy.consecutive_failures,
+                    config.proxy.max_consecutive_failures,
+                )
+                continue
             if proxy.id in active_assignments and proxy.assigned_campaign_id != campaign_id:
                 # Proxy is actively sticky to a different campaign
                 if proxy.is_sticky_active():

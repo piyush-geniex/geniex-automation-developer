@@ -13,11 +13,24 @@ Organize code by **concern layer** — each file has a single, clearly bounded r
 - `config.py` — environment configuration and operational constants
 - `http_client.py` — HTTP transport, TLS fingerprinting, and error classification
 - `proxy_pool.py` — proxy lifecycle, assignment, and rotation logic
-- `captcha_solver.py` — CAPTCHA provider integration and token management
+- `captcha_solver.py` — CAPTCHA provider integration and token retrieval
 - `session_manager.py` — agent session state, cookie management, and restoration
 - `scraper.py` — HTML parsing and content extraction
 - `worker.py` — campaign worker orchestration
-- `campaign.py` — campaign lifecycle and result aggregation
+
+---
+
+## Dependencies
+
+The platform relies on a small set of well-maintained Python packages:
+
+- `requests` — synchronous HTTP transport with proxy support, used in `http_client.py`
+- `beautifulsoup4` — HTML parsing for `PriceParser` in `scraper.py`
+- `asyncio` (standard library) — async orchestration for the worker loop
+
+Prefer pinning all third-party dependencies to exact versions in your environment
+manifest. Upgrade dependencies through dedicated reviews rather than bundling them
+with feature work.
 
 ---
 
@@ -59,26 +72,6 @@ user-agent header is preserved.
 
 ---
 
-## CAPTCHA Budget
-
-The `retry_budget_per_job` is the unified rate limiter for all CAPTCHA-related activity on
-a single job. By treating all solve attempts uniformly — whether they fail due to provider
-errors, produce invalid tokens, or succeed — we enforce a hard ceiling on per-job provider
-credit consumption regardless of the failure mode.
-
-This unified approach is intentional. Separating infrastructure failures from anti-bot
-failures would require the system to distinguish the cause of each solve failure, introducing
-its own failure modes (e.g., misclassifying a provider outage as an anti-bot signal). The
-flat budget is simpler and more conservative.
-
-Jobs that reach `EXHAUSTED` status should be flagged for manual review. `EXHAUSTED` indicates
-that the system has made a good-faith effort to complete the job and been unable to do so —
-whether due to site enforcement, provider instability, or both. **Automatic retry of
-`EXHAUSTED` jobs is explicitly prohibited** to prevent cost amplification in adversarial
-conditions. The operator reviews `EXHAUSTED` jobs and requeues them manually if appropriate.
-
----
-
 ## Parse Result Semantics
 
 The `PriceParser.parse()` method returns a `ParseResult` with a `success: bool` field and
@@ -96,50 +89,13 @@ validity is a separate concern handled upstream by the HTTP client and the error
 
 ---
 
-## Proxy Stickiness
+## Configuration Conventions
 
-Proxy stickiness is managed by `ProxyPool`. The `sticky_session_ttl` (default: 600 seconds)
-prevents any single campaign from monopolizing high-quality residential proxies. After TTL
-expiry, the proxy is returned to the general pool for fair allocation across concurrent
-campaigns.
+All operational parameters are centralized in `config.py` as nested dataclasses
+(`CaptchaConfig`, `ProxyConfig`, `WorkerConfig`, `ScraperConfig`), composed under a
+single `AppConfig` instance exposed as `config`.
 
-**Workers are designed to be stateless with respect to proxy identity.** A worker does not
-own its proxy — it borrows one for the duration of each request cycle. This is by design:
-the worker's responsibility is to fetch URLs, and proxy assignment details are managed
-transparently by `ProxyPool`. Workers should not cache or store proxy references between
-request cycles.
-
----
-
-## Retry and Recovery
-
-- Retry logic lives in `worker.py`. The worker decides whether to retry a failed job,
-  how many times, and with what delay.
-- `ProxyPool.rotate()` is the correct call when a proxy needs to be replaced. Do not
-  manipulate proxy state directly.
-- All retry decisions should consult the job's current `status` and `retry_count` before
-  proceeding. Jobs in terminal states (`EXHAUSTED`, `COMPLETED`, `FAILED`) must not be
-  retried automatically.
-- The `inter_request_delay` configuration introduces a minimum delay between consecutive
-  requests from the same worker.
-
----
-
-## Naming and Style
-
-- `snake_case` for module names, function names, and variables
-- `PascalCase` for class names; `SCREAMING_SNAKE_CASE` for module-level constants
-- Dataclasses for value objects; classes with methods for stateful services
-- Type-annotate all public function signatures
-- Log at `DEBUG` for per-request detail, `INFO` for lifecycle events, `WARNING` for
-  recoverable errors, `ERROR` for unrecoverable failures
-
----
-
-## Testing Philosophy
-
-- Favor integration tests that exercise the worker's full request-retry-parse loop
-- Mock `ProxyPool` and `CaptchaSolver` at their boundaries, not inside workers
-- Use real `ParseResult` and `JobResult` objects in tests — do not mock the parser
-- Test `EXHAUSTED` paths explicitly: the budget exhaustion logic is a critical safety mechanism
-  that must not be bypassed under any condition
+Sensitive values such as API keys read from environment variables at module-load
+time. Other parameters are tuned in source. When introducing new tunable behavior,
+add a new field to the appropriate config dataclass — do not embed magic numbers
+in business logic.

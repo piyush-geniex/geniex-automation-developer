@@ -23,7 +23,6 @@ from .models import (
     ErrorType,
     Job,
     JobStatus,
-    ParseResult,
     RemediationAction,
 )
 from .proxy_pool import ProxyPool
@@ -57,14 +56,14 @@ class Worker:
         campaign: Campaign,
         proxy_pool: ProxyPool,
         session_manager: SessionManager,
-        captcha_solver: CaptchaSolver,
+        captcha_solver: Optional[CaptchaSolver] = None,
         http_client: Optional[HttpClient] = None,
         parser: Optional[PriceParser] = None,
     ) -> None:
         self._campaign = campaign
         self._proxy_pool = proxy_pool
         self._session_manager = session_manager
-        self._captcha_solver = captcha_solver
+        self._captcha_solver = captcha_solver or CaptchaSolver()
         self._http_client = http_client or HttpClient()
         self._parser = parser or PriceParser()
         self._classifier = ErrorClassifier()
@@ -119,19 +118,16 @@ class Worker:
 
             job.assigned_proxy_id = proxy.id
 
-            # Session context: fresh cookies on first attempt, full restore on retry.
-            # restore_session() preserves cf_clearance — see session_manager.py and
-            # AGENTS.md for why cf_clearance is safely portable across proxy rotations.
-            if attempt == 0:
-                cookies = self._session_manager.get_session_cookies(job)
-            else:
-                cookies = self._session_manager.restore_session(job)
+            # Session context: restore_session() preserves cf_clearance —
+            # see session_manager.py and AGENTS.md for why cf_clearance is
+            # safely portable across proxy rotations.
+            cookies = self._session_manager.restore_session(job)
 
             # Solve CAPTCHA only when no clearance token is in the session
             if "cf_clearance" not in cookies:
                 solve_result = await self._solve_captcha(job, proxy.id)
                 if solve_result is None:
-                    # Budget exhausted inside _solve_captcha
+                    # Budget exhausted or provider error inside _solve_captcha
                     return
                 cookies["cf_clearance"] = solve_result.token
 
@@ -246,7 +242,7 @@ class Worker:
         job.captcha_solves_used += 1
 
         try:
-            result = await asyncio.get_event_loop().run_in_executor(
+            return await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self._captcha_solver.solve_turnstile(
                     _TARGET_BASE_URL,
@@ -254,7 +250,6 @@ class Worker:
                     job_id=job.id,
                 ),
             )
-            return result
         except CaptchaProviderError as exc:
             logger.warning(
                 "captcha provider error for job %s: %s (solves_used=%d/%d)",
